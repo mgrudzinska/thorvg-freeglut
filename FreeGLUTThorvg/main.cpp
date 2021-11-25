@@ -4,6 +4,7 @@
  * FreeGLUTThorvg, Created by Michal Maciola (m.maciola@samsung.com) on 17/11/2021.
  */
 
+
 #ifdef __APPLE_CC__
 #include <GLUT/glut.h>
 #else
@@ -17,12 +18,24 @@
 #include <iostream>
 
 // For benchmark
-//#define BENCHMARK
+// #define BENCHMARK
 
 #ifdef BENCHMARK
 #include <chrono>
 #include "string.h"
 #endif
+
+
+#define APPROX
+#define EXACT
+
+#ifdef APPROX
+#include "DP_alg.hpp"
+#include <cstring>
+#define APPROX_BUF_SIZE 30
+#define APPROX_EPSILON 2
+#endif
+
 
 using namespace std;
 using namespace tvg;
@@ -32,6 +45,8 @@ using namespace tvg;
 #define FPS 60
 #define INTERVAL (1000/FPS)
 
+#define DEF_SIZE 10
+
 GLubyte* PixelBuffer = new GLubyte[WIDTH * HEIGHT * 4];
 
 static CanvasEngine tvgEngine = CanvasEngine::Sw;
@@ -39,10 +54,17 @@ static unique_ptr<SwCanvas> swCanvas;
 static bool needInvalidation = false;
 static int mousePosition[] = {0, 0};
 static Shape* _pShape = nullptr;
+#ifdef EXACT
 static Shape* _pPath = nullptr;
+#endif
+#ifdef APPROX
+static Shape* _pApproxPath = nullptr;
+static int _newPoints = 0;
+#endif
 //static bool _menuUsed = false;
 static int _writingChosen = true;
 static int _drawingChosen = false;
+
 
 struct Color
 {
@@ -63,17 +85,35 @@ struct HandWriting
     uint32_t ptsSize = 0;
     uint32_t ptsReserved = 0;
 
+#ifdef APPROX
+    Point* approxBuf = nullptr;
+#endif
+
     HandWriting()
     {
-        cmdsReserved = 2;
+        cmdsReserved = DEF_SIZE;
         cmds = (PathCommand*)malloc(cmdsReserved * sizeof(PathCommand));
-        ptsReserved = 2;
+        ptsReserved = DEF_SIZE;
         pts = (Point*)malloc(ptsReserved * sizeof(Point));
+#ifdef APPROX
+        approxBuf = (Point*)malloc(APPROX_BUF_SIZE * sizeof(Point));
+#endif
     }
 
     ~HandWriting()
     {
-        reset();
+        if (cmds) free(cmds);
+        cmds = nullptr;
+        cmdsSize = cmdsReserved = 0;
+
+        if (pts) free(pts);
+        pts = nullptr;
+        ptsSize = ptsReserved = 0;
+
+#ifdef APPROX
+        if (approxBuf) free(approxBuf);
+        approxBuf = nullptr;
+#endif
     }
 
     bool addPathCommand(PathCommand cmd) {
@@ -101,21 +141,24 @@ struct HandWriting
     }
 
     void reset() {
-        if (cmds) free(cmds);
-        cmds = nullptr;
-        cmdsSize = cmdsReserved = 0;
+        cmdsSize = 0;
+        cmdsReserved = DEF_SIZE;
+        cmds = (PathCommand*)realloc(cmds, cmdsReserved * sizeof(PathCommand));;
 
-        if (pts) free(pts);
-        pts = nullptr;
-        ptsSize = ptsReserved = 0;
+        ptsSize = 0;
+        ptsReserved = DEF_SIZE;
+        pts = (Point*)realloc(pts, ptsReserved * sizeof(Point));
     }
 };
+#ifdef EXACT
 static HandWriting* hw = nullptr;
-
+#endif
+#ifdef APPROX
+static HandWriting* ahw = nullptr;
+#endif
 
 void createThorvgView(uint32_t threads) {
-    // Initialize the engine
-    if (Initializer::init(tvgEngine, 0) != Result::Success) {
+    if (Initializer::init(tvgEngine, threads) != Result::Success) {
         cerr << "Thorvg init failed: Engine is not supported" << endl;;
         return;
     }
@@ -180,7 +223,7 @@ void display() {
 #ifdef BENCHMARK
     auto end = chrono::steady_clock::now();
     auto memory = getVmSizeValue();
-    cout << "Time difference = " << chrono::duration_cast<chrono::microseconds>(end - begin).count() << "[µs], Memory used = " << memory << endl;
+    cout << "Time difference = " << chrono::duration_cast<chrono::microseconds>(end - begin).count() << " [µs], Memory used = " << memory << endl;
 #endif
 }
 
@@ -199,12 +242,28 @@ void handleDrawing(int state, int x, int y) {
 
 void handleWriting(int state, int x, int y) {
     if (state == GLUT_DOWN) {
+#ifdef EXACT
         if (!hw) hw = new HandWriting();
         hw->addPathCommand(PathCommand::MoveTo);
         hw->addPoint(x, y);
+#endif
+#ifdef APPROX
+        if (!ahw) ahw = new HandWriting();
+        ahw->addPathCommand(PathCommand::MoveTo);
+        ahw->addPoint(x, y);
+        _newPoints++;
+#endif
     } else {
+#ifdef EXACT
         _pPath = nullptr;
+        cout << "The exact data size: pts - " << hw->ptsSize << ", cmds - " << hw->cmdsSize << endl;
         hw->reset();
+#endif
+#ifdef APPROX
+        _pApproxPath = nullptr;
+        cout << "The approx data size: pts - " << ahw->ptsSize << ", cmds - " << ahw->cmdsSize << endl;
+        ahw->reset();
+#endif
     }
 }
 
@@ -257,6 +316,7 @@ void handleDrawing(int mx, int my) {
 
 void handleWriting(int mx, int my) {
     // Create hand writing
+#ifdef EXACT
     hw->addPathCommand(PathCommand::LineTo);
     hw->addPoint(mx, my);
 
@@ -270,8 +330,39 @@ void handleWriting(int mx, int my) {
 
     _pPath->appendPath(hw->cmds, hw->cmdsSize, hw->pts, hw->ptsSize);
     _pPath->stroke(_color.r, _color.g, _color.b, _color.a);
-    _pPath->stroke(2);
+    _pPath->stroke(4);
     swCanvas->update(_pPath);
+#endif
+
+#ifdef APPROX
+    ahw->addPathCommand(PathCommand::LineTo);
+    ahw->addPoint(mx, my);
+    _newPoints++;
+    if (_newPoints == APPROX_BUF_SIZE) {
+        _newPoints = 0;
+        int approxSize = approxPolyDP(ahw->pts + (ahw->ptsSize - APPROX_BUF_SIZE), APPROX_BUF_SIZE, ahw->approxBuf, APPROX_EPSILON, false);
+        memcpy(ahw->pts + (ahw->ptsSize - APPROX_BUF_SIZE), ahw->approxBuf, approxSize * sizeof(Point));
+        ahw->ptsSize -= (APPROX_BUF_SIZE - approxSize);
+        ahw->cmdsSize -= APPROX_BUF_SIZE;
+        for (int i = 0; i < approxSize/3; ++i)
+            ahw->cmds[ahw->cmdsSize++] = PathCommand::CubicTo;
+        ahw->cmdsSize += (approxSize % 3);
+    }
+
+    if (!_pApproxPath) {
+        auto approxPath = Shape::gen();
+        _pApproxPath = approxPath.get();
+        swCanvas->push(move(approxPath));
+        _newPoints = 0;
+    } else {
+        _pApproxPath->reset();
+    }
+
+    _pApproxPath->appendPath(ahw->cmds, ahw->cmdsSize, ahw->pts, ahw->ptsSize);
+    _pApproxPath->stroke(255, 0, 0, 255);
+    _pApproxPath->stroke(2);
+    swCanvas->update(_pApproxPath);
+#endif
 }
 
 
@@ -382,7 +473,12 @@ void close() {
     swCanvas->clear(true);
     Initializer::term(tvgEngine);
     delete[] PixelBuffer;
+#ifdef EXACT
     delete hw;
+#endif
+#ifdef APPROX
+    delete ahw;
+#endif
 }
 
 
@@ -394,7 +490,7 @@ int main(int argc, char** argv) {
 
     // Position, size and entitle window
     glutInitWindowSize(WIDTH, HEIGHT);
-    glutInitWindowPosition(700, 100);
+    glutInitWindowPosition(70, 100);
     glutCreateWindow("FreeGLUT with Thorvg");
 
     // Create thorvg view
