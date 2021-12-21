@@ -4,7 +4,6 @@
  * FreeGLUTThorvg, Created by Michal Maciola (m.maciola@samsung.com) on 17/11/2021.
  */
 
-
 #ifdef __APPLE_CC__
 #include <GLUT/glut.h>
 #else
@@ -26,16 +25,22 @@
 #endif
 
 
-#define APPROX
+#define SHAPE_RECOG
+//#define APPROX
 #define EXACT
 
-#ifdef APPROX
-#include "DP_alg.hpp"
-#include <cstring>
-#define APPROX_BUF_SIZE 30
-#define APPROX_EPSILON 2
+#if defined(APPROX) || defined(SHAPE_RECOG)
+  #include "DP_alg.hpp"
+  #ifdef APPROX
+    #include <cstring>
+    #define APPROX_BUF_SIZE 30
+    #define APPROX_EPSILON 2
+  #endif
+  #ifdef SHAPE_RECOG
+    #define SHAPE_RECOG_EPSILON 0.03 //for 0.02 square often has 5 corners
+    #include <float.h>
+  #endif
 #endif
-
 
 using namespace std;
 using namespace tvg;
@@ -157,6 +162,438 @@ static HandWriting* hw = nullptr;
 static HandWriting* ahw = nullptr;
 #endif
 
+
+#ifdef SHAPE_RECOG
+
+#define CLOSING_TOLERANCE_POINTS 10
+#define CLOSING_TOLERANCE_RADIUS 0.1
+#define RAD_TO_DEG 57.29578f   // 180/M_PI
+#define DEG_TO_RAD 0.017453f   // M_PI/180
+#define PI_2 1.570796f         // M_PI/2
+#define TWO_PI 6.283185f       // 2*M_PI
+#define PI_6 0.523599f         // M_PI/6.0f
+#define ORTHOGONALITY_TOLERANCE   10 * DEG_TO_RAD  // TODO: choose smaller value - 10 is only for tests
+#define ANGLES_EQUALITY_TOLERANCE 10 * DEG_TO_RAD  // TODO: choose smaller value - 10 is only for tests
+#define SLOPE_TOLERANCE           10 * DEG_TO_RAD  // TODO: choose smaller value - 10 is only for tests
+
+
+inline float exactLength(const Point& p1, const Point& p2)
+{
+    Point distance = {p2.x - p1.x, p2.y - p1.y};
+
+    return sqrtf(distance.x * distance.x + distance.y * distance.y);
+}
+
+
+// aplha max plus beta min (alpha = 1, beta = 3/8 -> largest error 6.8%)
+inline float approxLength(const Point& p1, const Point& p2)
+{
+    Point distance = {p2.x - p1.x, p2.y - p1.y};
+    if (distance.x < 0) distance.x = -distance.x;
+    if (distance.y < 0) distance.y = -distance.y;
+
+    return (distance.x > distance.y) ? (distance.x + distance.y * 0.375f) : (distance.y + distance.x * 0.375f);
+}
+
+
+float approxPerimiter(const Point* contour, int contourSize)
+{
+    float peri = 0.0f;
+
+    for (int i = 1; i < contourSize; ++i)
+        peri += approxLength(contour[i - 1], contour[i]);
+
+    return peri;
+}
+
+
+Point findCenter(const Point* contour, int contourSize)
+{
+    float cx = 0.0f, cy = 0.0f;
+
+    for (int i = 0; i < contourSize; ++i) {
+        cx += contour[i].x;
+        cy += contour[i].y;
+    }
+    cx /= contourSize;
+    cy /= contourSize;
+
+    return {cx, cy};
+}
+
+
+// check whether the first and the last CLOSING_TOLERANCE_POINTS points lie in the same area of a CLOSING_TOLERANCE_RADIUS radius (% of the perimiter)
+// TODO: should the tolerance depend on the stroke width ?
+bool closedContour(const Point* contour, int contourSize, float perimiter)
+{
+    int tolerance = (2 * CLOSING_TOLERANCE_POINTS > contourSize ? contourSize / 2 : CLOSING_TOLERANCE_POINTS);
+    Point centerBegin = findCenter(contour, tolerance);
+    Point centerEnd = findCenter(contour + (contourSize - tolerance), tolerance);
+    Point center = {(centerBegin.x + centerEnd.x) / 2.0f, (centerBegin.y + centerEnd.y) / 2.0f};
+    float radius = perimiter * CLOSING_TOLERANCE_RADIUS;
+
+    for (int i = 0; i < tolerance; ++i) {
+        if (approxLength(contour[i], center) > radius ||
+            approxLength(contour[contourSize - 1 - i], center) > radius) {
+                return false;
+        }
+    }
+    return true;
+}
+
+
+float angle(const Point& A, const Point& B, const Point& C) {
+    float lenAB = exactLength(A, B);
+    Point normalizedAB = {(A.x - B.x) / lenAB, (A.y - B.y) / lenAB};
+    float lenBC = exactLength(B, C);
+    Point normalizedBC = {(C.x - B.x) / lenBC, (C.y - B.y) / lenBC};
+
+    return acos(normalizedAB.x * normalizedBC.x + normalizedAB.y * normalizedBC.y);
+}
+
+
+// TODO: some parts of the code can be unified
+Shape* recognizeTriangle(Point* triangle)
+{
+    const int vertices = 3;
+    Point center = findCenter(triangle, vertices);
+
+    bool isOrthogonal = false;
+    bool isEquilateral = true;
+    bool isIsosceles = false;
+
+    uint8_t orthogonalVertex;
+    uint8_t topVertex = 0;
+    uint8_t isoscelesVertex;
+    uint8_t maxSideVertex;
+
+    float maxSideLength = 0;
+    float r = 0.0f;
+
+    float slope;
+
+    for (int i = 0; i < vertices; ++i) {
+        auto length = exactLength(triangle[i], triangle[(i + 1) % vertices]);
+        if (maxSideLength < length) {
+            maxSideLength = length;
+            maxSideVertex = i;
+            if (fabsf(triangle[(i + 1) % vertices].x - triangle[i].x) < FLT_EPSILON) {
+                slope = PI_2;
+                // TODO: check this case - is the y sign important?
+            } else {
+                slope = atan((triangle[(i + 1) % vertices].y - triangle[i].y) / (triangle[(i + 1) % vertices].x - triangle[i].x));
+            }
+        }
+        if (triangle[i].y < triangle[topVertex].y) topVertex = i;
+        r += exactLength(triangle[i], center);
+    }
+    r /= vertices;
+
+    float angles[vertices];
+
+    for (int i = 0; i < vertices; ++i) {
+        Point A = triangle[i];
+        Point B = triangle[(i + 1) % vertices];
+        Point C = triangle[(i + 2) % vertices];
+
+        angles[(i + 1) % vertices] = angle(A, B, C);
+    }
+
+    for (int i = 0; i < vertices; ++i) {
+        //isosceles triangle
+        if (fabsf(angles[i] - angles[(i + 1) % vertices]) < ANGLES_EQUALITY_TOLERANCE) {
+            isoscelesVertex = i;
+            isIsosceles = true;
+        } 
+        //equilateral triangle
+        if (fabsf(angles[i] - M_PI / 3.0f) > ANGLES_EQUALITY_TOLERANCE) {
+            isEquilateral = false;
+        }
+        //orthogonal triangle
+        if (fabsf(angles[i] - PI_2) < ORTHOGONALITY_TOLERANCE) {
+            isOrthogonal = true;
+            orthogonalVertex = i;
+        }
+    }
+    //either isosceles with two angles ~90deg or orthogonal
+    if (isIsosceles && (orthogonalVertex == isoscelesVertex || orthogonalVertex == ((isoscelesVertex + 1) % vertices)))
+        isOrthogonal = false;
+
+    auto ABC = Shape::gen();
+
+    if (isEquilateral) {
+        float cosSlope = cos(slope);
+        float sinSlope = sin(slope);
+        Point transformed = {cosSlope * (triangle[(maxSideVertex + 1) % vertices].x - triangle[maxSideVertex].x) + sinSlope * (triangle[(maxSideVertex + 1) % vertices].y - triangle[maxSideVertex].y) + triangle[maxSideVertex].x,
+                            -sinSlope * (triangle[(maxSideVertex + 1) % vertices].x - triangle[maxSideVertex].x) + cosSlope * (triangle[(maxSideVertex + 1) % vertices].y - triangle[maxSideVertex].y) + triangle[maxSideVertex].y};
+
+        int signAB = 1;
+        if (triangle[(maxSideVertex + 1) % vertices].x > triangle[maxSideVertex].x) signAB = -1;
+
+        float dAngle = TWO_PI / vertices;
+        ABC->moveTo(r * sin(dAngle * (-0.5f)), r * cos(dAngle * (-0.5f)));
+        for (int i = 1; i < vertices; ++i) {
+            ABC->lineTo(r * sin(dAngle * (i - 0.5f)), r * cos(dAngle * (i - 0.5f)));
+        }
+        ABC->close();
+
+        float rotAngle = angle({2 * center.x, center.y}, center, triangle[topVertex]) + PI_6;
+        int n = round(rotAngle / PI_6);
+        if (fabsf(n * PI_6 - rotAngle) < ANGLES_EQUALITY_TOLERANCE) {
+            rotAngle = n * PI_6;
+        }
+
+        ABC->rotate(-rotAngle * RAD_TO_DEG);
+        ABC->translate(center.x, center.y);
+        return ABC.release();
+    } else if (isOrthogonal) {
+        Point A = triangle[maxSideVertex];
+
+        if (fabsf(slope) < SLOPE_TOLERANCE) slope = 0.0f;
+        else if (fabsf(slope - PI_2) < SLOPE_TOLERANCE) slope = PI_2;
+        else if (fabsf(slope + PI_2) < SLOPE_TOLERANCE) slope = -PI_2;
+        float cosSlope = cos(slope);
+        float sinSlope = sin(slope);
+
+        Point transformedB = {cosSlope * (triangle[(maxSideVertex + 1) % vertices].x - A.x) + sinSlope * (triangle[(maxSideVertex + 1) % vertices].y - A.y) + A.x,
+                             -sinSlope * (triangle[(maxSideVertex + 1) % vertices].x - A.x) + cosSlope * (triangle[(maxSideVertex + 1) % vertices].y - A.y) + A.y};
+
+        int signAB = 1;
+        if (transformedB.x < A.x) signAB = -1;
+
+        Point B = {A.x + signAB * maxSideLength, A.y};
+
+        float dAngle = (angles[(maxSideVertex + 2) % vertices] - PI_2) / 2.0f;
+        float angle1 = angles[maxSideVertex] + dAngle;
+        float angle2 = angles[(maxSideVertex + 1) % vertices] + dAngle;
+        if (isIsosceles) angle1 = angle2 = M_PI / 4.0f;
+
+        float side = sin(angle1) * maxSideLength;
+        float dx = cos(angle2) * side;
+        float dy = -sin(angle2) * side;
+
+        int signBC = 1;
+        float transformedCy = -sinSlope * (triangle[(maxSideVertex + 2) % vertices].x - A.x) + cosSlope * (triangle[(maxSideVertex + 2) % vertices].y - A.y) + A.y;
+        if (transformedCy > transformedB.y) signBC = -1;
+        Point C = {B.x - dx * signAB, B.y + dy * signBC};
+
+        Point transC = {cos(-slope) * (C.x - A.x) + sin(-slope) * (C.y - A.y) + A.x,
+                       -sin(-slope) * (C.x - A.x) + cos(-slope) * (C.y - A.y) + A.y};
+
+        if (fabsf(transC.x + A.x) > FLT_EPSILON) {
+            float align = atan((transC.y - A.y) / (transC.x - A.x));
+            float check[5] = {0.0f, M_PI, -M_PI, -PI_2, PI_2};
+            for (int i = 0; i < 5; ++i) {
+                if (fabsf(align - check[i]) < SLOPE_TOLERANCE) {
+                    slope -= (align - check[i]);
+                    break;
+                }
+            }
+        }
+
+        ABC->moveTo(0, 0);
+        ABC->lineTo(B.x - A.x, B.y - A.y);
+        ABC->lineTo(C.x - A.x, C.y - A.y);
+        ABC->close();
+        ABC->rotate(slope * RAD_TO_DEG);
+        ABC->translate(A.x, A.y);
+
+        return ABC.release();
+    } else if (isIsosceles) {
+        Point A = triangle[isoscelesVertex];
+
+        if (isoscelesVertex != maxSideVertex) {
+            if (fabsf(triangle[(isoscelesVertex + 1) % vertices].x - triangle[isoscelesVertex].x) < FLT_EPSILON) {
+                slope = PI_2;
+            } else {
+                slope = atan((triangle[(isoscelesVertex + 1) % vertices].y - triangle[isoscelesVertex].y) / (triangle[(isoscelesVertex + 1) % vertices].x - triangle[isoscelesVertex].x));
+            }
+        }
+
+        if (fabsf(slope) < SLOPE_TOLERANCE) slope = 0.0f;
+        else if (fabsf(slope - PI_2) < SLOPE_TOLERANCE) slope = PI_2;
+        else if (fabsf(slope + PI_2) < SLOPE_TOLERANCE) slope = -PI_2;
+        float cosSlope = cos(slope);
+        float sinSlope = sin(slope);
+
+        Point transformedB = {cosSlope * (triangle[(isoscelesVertex + 1) % vertices].x - A.x) + sinSlope * (triangle[(isoscelesVertex + 1) % vertices].y - A.y) + A.x,
+                             -sinSlope * (triangle[(isoscelesVertex + 1) % vertices].x - A.x) + cosSlope * (triangle[(isoscelesVertex + 1) % vertices].y - A.y) + A.y};
+
+        int signAB = 1;
+        if (transformedB.x < A.x) signAB = -1;
+
+        Point B = {A.x + signAB * exactLength(A, triangle[(isoscelesVertex + 1) % vertices]), A.y};
+
+        float angle = (angles[isoscelesVertex] + angles[(isoscelesVertex + 1) % vertices]) / 2.0f;
+
+        float side = exactLength(A, triangle[(isoscelesVertex + 1) % vertices]) / 2.0f / cos(angle);
+        float dx = exactLength(A, triangle[(isoscelesVertex + 1) % vertices]) / 2.0f;
+        float dy = -sin(angle) * side;
+
+        int signBC = 1;
+        float transformedCy = -sinSlope * (triangle[(isoscelesVertex + 2) % vertices].x - A.x) + cosSlope * (triangle[(isoscelesVertex + 2) % vertices].y - A.y) + A.y;
+        if (transformedCy > transformedB.y) signBC = -1;
+        Point C = {B.x - dx * signAB, B.y + dy * signBC};
+
+        Point transC = {cos(-slope) * (C.x - A.x) + sin(-slope) * (C.y - A.y) + A.x,
+                       -sin(-slope) * (C.x - A.x) + cos(-slope) * (C.y - A.y) + A.y};
+
+        ABC->moveTo(0, 0);
+        ABC->lineTo(B.x - A.x, B.y - A.y);
+        ABC->lineTo(C.x - A.x, C.y - A.y);
+        ABC->close();
+        ABC->rotate(slope * RAD_TO_DEG);
+        ABC->translate(A.x, A.y);
+
+        return ABC.release();
+    }
+ 
+    ABC->moveTo(triangle[0].x, triangle[0].y);
+    ABC->lineTo(triangle[1].x, triangle[1].y);
+    ABC->lineTo(triangle[2].x, triangle[2].y);
+    ABC->close();
+
+    return ABC.release();
+}
+
+
+Shape* recognizeRectangle(const Point* rectangle)
+{
+    const int vertices = 4;
+
+    // final result parameters
+    float x, y, w, h;
+    float alpha;
+    Point shift;
+
+    float area = FLT_MAX;
+
+    for (int i = 0; i < vertices; ++i) {
+        Point start = rectangle[i];
+        Point end = rectangle[(i + 1) % vertices];
+
+        float slope = atan((end.y - start.y) / (end.x - start.x));
+        float cosSlope = cos(slope);
+        float sinSlope = sin(slope);
+
+        Point min = {0, 0};
+        Point max = {0, 0};
+
+        // points are translated so that rect[0] = (0,0) and rotated so the start-end line is axis aligned
+        for (int j = 1 + i; j < vertices + i; ++j) {
+            Point transformed = {cosSlope * (rectangle[j % vertices].x - start.x) + sinSlope * (rectangle[j % vertices].y - start.y),
+                                -sinSlope * (rectangle[j % vertices].x - start.x) + cosSlope * (rectangle[j % vertices].y - start.y)};
+            if (transformed.x < min.x) min.x = transformed.x;
+            if (transformed.y < min.y) min.y = transformed.y;
+            if (transformed.x > max.x) max.x = transformed.x;
+            if (transformed.y > max.y) max.y = transformed.y;
+        }
+
+        float width = max.x - min.x;
+        float height = max.y - min.y;
+        if (width * height < area) {
+            x = min.x;
+            y = min.y; 
+            w = width;
+            h = height;
+            shift.x = start.x;
+            shift.y = start.y;
+            alpha = slope;
+            area = w * h;
+        }
+    }
+
+    auto rect = Shape::gen();
+    rect->appendRect(x, y, w, h, 0, 0);
+    rect->rotate(alpha * 180.0f / M_PI);
+    rect->translate(shift.x, shift.y);
+
+    return rect.release();
+}
+
+
+Shape* recognizePolygon(Point* contour, int vertices)
+{
+    Point center = findCenter(contour, vertices);
+
+    float r = 0.0f;
+    for (int i = 0; i < vertices; ++i) {
+        r += approxLength(contour[i], center);
+    }
+    r /= vertices;
+
+    //TODO: juz moge wypisac punkty - zakladam zawsze ze podstawa || OX
+    auto polygon = Shape::gen();
+
+    auto angle = 2.0f * M_PI / vertices;
+    polygon->moveTo(center.x + r * sin(-M_PI / vertices), center.y + r * cos(-M_PI / vertices));
+    for (int i = 1; i < vertices; ++i) {
+        polygon->lineTo(center.x + r * sin(angle * (i - 0.5)), center.y  + r * cos(angle * (i - 0.5)));
+    }
+    polygon->close();
+
+    return polygon.release();
+}
+
+
+Shape* recognizeCircle(Point* contour, int vertices)
+{
+    Point center = findCenter(contour, vertices);
+    uint8_t rMaxVertex;
+
+    float rMin = FLT_MAX, rMax = 0.0f;
+    for (int i = 0; i < vertices; ++i) {
+        auto length = approxLength(contour[i], center);
+        if (rMin > length) rMin = length;
+        if (rMax < length) {
+            rMax = length;
+            rMaxVertex = i;
+        }
+    } 
+
+    auto circle = Shape::gen();
+    circle->appendCircle(0, 0, rMax, rMin);
+
+    float slope = angle({2 * center.x, center.y}, center, contour[rMaxVertex]);
+    int sign = (contour[rMaxVertex].y < center.y ? -1 : 1);
+    circle->rotate(sign * slope * RAD_TO_DEG);
+    circle->translate(center.x, center.y);
+
+    return circle.release();
+}
+
+
+Shape* recognizeShape(const Point* contour, int contourSize)
+{
+    if (contourSize < 2) return nullptr;
+
+    float peri = approxPerimiter(contour, contourSize);
+    if (!closedContour(contour, contourSize, peri)) return nullptr;
+
+    auto shapeRecogBuf = (Point*)malloc(contourSize * sizeof(Point));
+    int vertices = approxPolyDP(contour, contourSize, shapeRecogBuf, SHAPE_RECOG_EPSILON * peri, true);
+
+    Shape* shape = nullptr;
+
+    //TODO: compare the areas of the original and the recognized shapes? or the outermost points? some check has to be done
+    if (vertices == 2) {
+    } else if (vertices == 3) {
+        shape = recognizeTriangle(shapeRecogBuf);
+    } else if (vertices == 4) {
+        shape = recognizeRectangle(shapeRecogBuf);
+//    } else if (vertices < 7) {
+//        shape = recognizePolygon(shapeRecogBuf, vertices);
+    } else {
+        shape = recognizeCircle(shapeRecogBuf, vertices);
+    }
+
+    free(shapeRecogBuf);
+
+    return shape;
+}
+#endif
+
+
 void createThorvgView(uint32_t threads) {
     if (Initializer::init(tvgEngine, threads) != Result::Success) {
         cerr << "Thorvg init failed: Engine is not supported" << endl;;
@@ -255,10 +692,20 @@ void handleWriting(int state, int x, int y) {
 #endif
     } else {
 #ifdef EXACT
+  #ifdef SHAPE_RECOG
+        if (auto polygon = recognizeShape(hw->pts, hw->ptsSize)) {
+            polygon->stroke(4);
+            polygon->stroke(0, 0, 255, 200);
+            swCanvas->push(unique_ptr<Shape>(polygon));
+            swCanvas->draw();
+            display();
+        }
+  #endif
         _pPath = nullptr;
         cout << "The exact data size: pts - " << hw->ptsSize << ", cmds - " << hw->cmdsSize << endl;
         hw->reset();
 #endif
+
 #ifdef APPROX
         _pApproxPath = nullptr;
         cout << "The approx data size: pts - " << ahw->ptsSize << ", cmds - " << ahw->cmdsSize << endl;
@@ -338,6 +785,7 @@ void handleWriting(int mx, int my) {
     ahw->addPathCommand(PathCommand::LineTo);
     ahw->addPoint(mx, my);
     _newPoints++;
+
     if (_newPoints == APPROX_BUF_SIZE) {
         _newPoints = 0;
         int approxSize = approxPolyDP(ahw->pts + (ahw->ptsSize - APPROX_BUF_SIZE), APPROX_BUF_SIZE, ahw->approxBuf, APPROX_EPSILON, false);
